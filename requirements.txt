@@ -1,6 +1,4 @@
 streamlit
-python-docx
 google-generativeai
-pydub
-ffmpeg-python
+python-docx
 youtube-transcript-api
