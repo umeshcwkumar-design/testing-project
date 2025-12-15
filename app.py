@@ -1,202 +1,148 @@
+import os
+import re
+import time
+import tempfile
+
 import streamlit as st
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from docx import Document
 from docx.shared import Pt
-import tempfile
-import os
-import re
+
 
 # ----------------------------
-# Config
+# Page config
 # ----------------------------
-st.set_page_config(
-    page_title="Audio / YouTube → Transcript DOCX",
-    layout="wide"
-)
+st.set_page_config(page_title="Aiclex Transcript DOCX", layout="wide")
 
-st.title("🎙️ Audio / YouTube → Transcript & Notes (DOCX)")
-st.caption("Gemini API powered | Streamlit Community Ready")
 
 # ----------------------------
-# Gemini Setup (from secrets)
+# First-time Loading Screen
 # ----------------------------
+if "booted" not in st.session_state:
+    st.session_state.booted = True
+
+    st.markdown(
+        """
+        <div style="text-align:center; padding: 60px 20px;">
+            <h1 style="margin-bottom: 10px;">Aiclex Technologies</h1>
+            <h3 style="margin-top: 0px; opacity: 0.8;">Made by Umesh Kumar</h3>
+            <p style="margin-top: 30px; font-size: 18px;">Loading…</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.spinner("Initializing..."):
+        time.sleep(2)
+    st.rerun()
+
+
+# ----------------------------
+# Gemini setup (from secrets)
+# ----------------------------
+st.title("🎙️ Aiclex Transcript → Structured Notes → DOCX")
+st.caption("Upload Audio/Video or use YouTube link, then generate a DOCX with headings/subheadings.")
+
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception:
-    st.error("❌ Gemini API key missing. Please add it in secrets.toml")
+    st.error("❌ Gemini API key missing. Add it in `.streamlit/secrets.toml` as GEMINI_API_KEY.")
     st.stop()
 
-model = genai.GenerativeModel("gemini-1.5-flash")
+# You can switch model if you want:
+# gemini-1.5-flash (fast) or gemini-1.5-pro (better quality)
+MODEL_NAME = "gemini-1.5-flash"
+model = genai.GenerativeModel(MODEL_NAME)
+
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def extract_youtube_id(url):
+def extract_youtube_id(url: str) -> str | None:
     patterns = [
         r"v=([a-zA-Z0-9_-]{6,})",
         r"youtu\.be/([a-zA-Z0-9_-]{6,})",
         r"youtube\.com/shorts/([a-zA-Z0-9_-]{6,})",
     ]
     for p in patterns:
-        match = re.search(p, url)
-        if match:
-            return match.group(1)
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
     return None
 
 
-def get_youtube_transcript(url):
-    video_id = extract_youtube_id(url)
-    if not video_id:
-        raise ValueError("Invalid YouTube URL")
+def get_youtube_transcript_text(url: str) -> str:
+    vid = extract_youtube_id(url)
+    if not vid:
+        raise ValueError("Invalid YouTube link (video id not found).")
 
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    transcript = YouTubeTranscriptApi.get_transcript(vid)
     lines = []
     for t in transcript:
-        start = round(t["start"], 2)
-        text = t["text"].replace("\n", " ")
+        start = round(float(t.get("start", 0.0)), 2)
+        text = (t.get("text", "") or "").replace("\n", " ")
         lines.append(f"[{start}s] {text}")
     return "\n".join(lines)
 
 
-def generate_structured_notes(raw_text, language, style):
+def gemini_transcribe_file(file_bytes: bytes, mime_type: str) -> str:
+    """
+    Upload file to Gemini and ask it to transcribe.
+    Works for many audio/video mime types (depends on Gemini support).
+    """
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        uploaded = genai.upload_file(tmp_path, mime_type=mime_type)
+
+        prompt = """
+Transcribe this media accurately.
+Return transcript as plain text.
+If you can infer timestamps, include them in [00:00] format, otherwise skip timestamps.
+"""
+
+        resp = model.generate_content([prompt, uploaded])
+        return resp.text.strip()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def gemini_make_structured_doc(raw_transcript: str, language: str, style: str) -> str:
     prompt = f"""
-You are a professional transcription editor.
+You are a professional transcription editor and note writer.
 
-TASK:
-Convert the given transcript into a clean, structured Markdown document.
+Convert the given transcript into a clean, well-structured Markdown document.
 
-RULES:
-- Language: {language}
-- Style: {style}
-- Use headings and subheadings
-- Improve readability
-- Do NOT change meaning
+Language: {language}
+Style: {style}
 
-STRUCTURE:
+Output format MUST be Markdown with headings/subheadings:
 # Title
 ## Key Takeaways
 ## Detailed Transcript
 ## Summary
 
+Rules:
+- Improve readability (remove filler words lightly) but do NOT change meaning.
+- Use bullet points where helpful.
+- Keep it clean and usable as a document.
+- If transcript seems incomplete, mention it politely in Summary.
+
 TRANSCRIPT:
-{raw_text}
+{raw_transcript}
 """
+    resp = model.generate_content(prompt)
+    return resp.text
 
-    response = model.generate_content(prompt)
-    return response.text
 
-
-def create_docx(title, content):
+def create_docx(title: str, content_md: str) -> bytes:
     doc = Document()
     doc.add_heading(title, level=0)
 
-    for line in content.splitlines():
-        line = line.strip()
-        if not line:
-            doc.add_paragraph("")
-            continue
-
-        if line.startswith("### "):
-            doc.add_heading(line[4:], level=3)
-        elif line.startswith("## "):
-            doc.add_heading(line[3:], level=2)
-        elif line.startswith("# "):
-            doc.add_heading(line[2:], level=1)
-        elif line.startswith("- "):
-            p = doc.add_paragraph(line[2:], style="List Bullet")
-            for r in p.runs:
-                r.font.size = Pt(11)
-        else:
-            p = doc.add_paragraph(line)
-            for r in p.runs:
-                r.font.size = Pt(11)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-        doc.save(tmp.name)
-        path = tmp.name
-
-    with open(path, "rb") as f:
-        data = f.read()
-
-    os.remove(path)
-    return data
-
-# ----------------------------
-# UI
-# ----------------------------
-tab1, tab2 = st.tabs(["▶️ YouTube Link", "📝 Paste Transcript"])
-
-raw_text = None
-
-with tab1:
-    st.subheader("YouTube Video")
-    yt_url = st.text_input("Paste YouTube URL")
-
-    if yt_url:
-        try:
-            raw_text = get_youtube_transcript(yt_url)
-            st.success("Transcript fetched successfully")
-            with st.expander("Preview Transcript"):
-                st.text(raw_text[:3000])
-        except Exception as e:
-            st.error(str(e))
-
-with tab2:
-    st.subheader("Paste Transcript")
-    pasted_text = st.text_area(
-        "Paste raw transcript here",
-        height=250,
-        placeholder="Paste audio / video transcript here..."
-    )
-
-    if pasted_text.strip():
-        raw_text = pasted_text.strip()
-
-# ----------------------------
-# Settings
-# ----------------------------
-st.divider()
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    language = st.selectbox("Output Language", ["English", "Hindi", "Hinglish"])
-with col2:
-    style = st.selectbox(
-        "Document Style",
-        ["Professional Notes", "Lecture Notes", "Meeting Minutes", "Podcast Notes"]
-    )
-with col3:
-    file_name = st.text_input("DOCX File Name", "transcript_notes.docx")
-
-title = st.text_input("Document Title", "Transcript & Notes")
-
-# ----------------------------
-# Generate
-# ----------------------------
-st.divider()
-generate = st.button("🚀 Generate DOCX", use_container_width=True)
-
-if generate:
-    if not raw_text or len(raw_text) < 50:
-        st.error("Please provide a transcript or YouTube link.")
-        st.stop()
-
-    with st.spinner("Generating structured transcript using Gemini..."):
-        structured = generate_structured_notes(raw_text, language, style)
-
-    st.success("Done!")
-
-    st.markdown("### 📄 Preview")
-    st.markdown(structured)
-
-    docx = create_docx(title, structured)
-
-    st.download_button(
-        "⬇️ Download DOCX",
-        data=docx,
-        file_name=file_name,
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        use_container_width=True
-    )
+    for line
